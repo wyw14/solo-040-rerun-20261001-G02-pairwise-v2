@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/wyw14/cry-96/internal/model"
 	"github.com/wyw14/cry-96/internal/signal"
+	"github.com/wyw14/cry-96/internal/waterway"
 )
 
 type vesselInput struct {
@@ -37,6 +38,14 @@ func createPlanHandler(runtime *Runtime) http.HandlerFunc {
 				return
 			}
 			vessels = append(vessels, vessel)
+		}
+		if blockers := runtime.Waterway.Blockers(input.Direction); len(blockers) > 0 {
+			// Fail fast before anything is planned; the authoritative atomic
+			// check still happens when the transit starts.
+			writeError(w, http.StatusConflict, &waterway.ConflictError{
+				Direction: input.Direction, Phase: model.WaterwayEntry, Blockers: blockers,
+			})
+			return
 		}
 		plan, err := runtime.Schedule.Create(r.Context(), input.ChamberID, input.Direction, vessels)
 		if err != nil {

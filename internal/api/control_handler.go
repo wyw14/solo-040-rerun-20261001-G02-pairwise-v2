@@ -17,13 +17,34 @@ func openGateHandler(runtime *Runtime) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, errors.New("invalid gate direction"))
 			return
 		}
-		command, err := runtime.Interlocks.RequestOpen(r.Context(), mustCurrent(runtime, chamberID), direction, "http:"+requestID(r.Context()))
+		cycleValue := mustCurrent(runtime, chamberID)
+		if cycleValue.Stage == model.StageLeveling {
+			// Opening a gate now releases the fleet into the shared waterway;
+			// opposing headings must not hold it at the same time.
+			if _, err := runtime.Waterway.Acquire(r.Context(), cycleValue, model.WaterwayExit, waterwayFleet(runtime, cycleValue)); err != nil {
+				writeError(w, http.StatusConflict, err)
+				return
+			}
+		}
+		command, err := runtime.Interlocks.RequestOpen(r.Context(), cycleValue, direction, "http:"+requestID(r.Context()))
 		if err != nil {
 			writeError(w, http.StatusConflict, err)
 			return
 		}
 		writeJSON(w, http.StatusAccepted, command)
 	}
+}
+
+func waterwayFleet(runtime *Runtime, cycleValue model.TransitCycle) []string {
+	plan, ok := runtime.Planner.Get(cycleValue.PlanID)
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(plan.Vessels))
+	for _, vessel := range plan.Vessels {
+		names = append(names, vessel.Name)
+	}
+	return names
 }
 
 func mustCurrent(runtime *Runtime, chamberID string) model.TransitCycle {

@@ -13,6 +13,14 @@ import (
 	"github.com/wyw14/cry-96/internal/model"
 )
 
+// WaterwayTracker releases shared-waterway occupations as a transit
+// progresses: entry hold once the fleet is sealed inside, everything on
+// cancel, emergency or confirmed departure.
+type WaterwayTracker interface {
+	ReleasePhase(ctx context.Context, cycle model.TransitCycle, phase model.WaterwayPhase, reason string) error
+	ReleaseAll(ctx context.Context, cycle model.TransitCycle, reason string) error
+}
+
 // Coordinator is the authoritative owner of active transit generations.
 type Coordinator struct {
 	mu          sync.RWMutex
@@ -21,6 +29,7 @@ type Coordinator struct {
 	gates       *gate.Controller
 	hydraulics  *hydraulics.Controller
 	recorder    *journal.Recorder
+	waterway    WaterwayTracker
 	now         func() time.Time
 }
 
@@ -62,6 +71,20 @@ func (c *Coordinator) Current(chamberID string) (model.TransitCycle, bool) {
 	return cycleValue.Clone(), ok
 }
 
+// BindWaterway attaches the shared-waterway tracker after construction.
+func (c *Coordinator) BindWaterway(tracker WaterwayTracker) {
+	c.mu.Lock()
+	c.waterway = tracker
+	c.mu.Unlock()
+}
+
+func (c *Coordinator) waterwayTracker() WaterwayTracker {
+	c.mu.RLock()
+	tracker := c.waterway
+	c.mu.RUnlock()
+	return tracker
+}
+
 func (c *Coordinator) Cancel(ctx context.Context, chamberID, reason string) (model.TransitCycle, error) {
 	c.mu.Lock()
 	cycleValue, ok := c.current[chamberID]
@@ -75,8 +98,15 @@ func (c *Coordinator) Cancel(ctx context.Context, chamberID, reason string) (mod
 	}
 	c.current[chamberID] = cycleValue
 	c.mu.Unlock()
-	_, err := c.recorder.Record(ctx, chamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue)
-	return cycleValue, err
+	if _, err := c.recorder.Record(ctx, chamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue); err != nil {
+		return cycleValue, err
+	}
+	if tracker := c.waterwayTracker(); tracker != nil {
+		if err := tracker.ReleaseAll(ctx, cycleValue, "transit "+string(cycleValue.Stage)+": "+reason); err != nil {
+			return cycleValue, err
+		}
+	}
+	return cycleValue, nil
 }
 
 func (c *Coordinator) ApplyGateAck(ctx context.Context, ack model.DeviceAck) error {
@@ -106,8 +136,18 @@ func (c *Coordinator) ApplyGateAck(ctx context.Context, ack model.DeviceAck) err
 			return err
 		}
 	}
-	_, err = c.recorder.Record(ctx, ack.ChamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue)
-	return err
+	if _, err := c.recorder.Record(ctx, ack.ChamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue); err != nil {
+		return err
+	}
+	if next == model.StageSealed {
+		if tracker := c.waterwayTracker(); tracker != nil {
+			// Fleet is fully inside the chamber; the approach waterway is free again.
+			if err := tracker.ReleasePhase(ctx, cycleValue, model.WaterwayEntry, "fleet sealed in chamber"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (c *Coordinator) ApplySignalHandoff(ctx context.Context, cycleID uuid.UUID, generation uint64) error {
@@ -131,8 +171,18 @@ func (c *Coordinator) ApplySignalHandoff(ctx context.Context, cycleID uuid.UUID,
 	cycleValue.UpdatedAt = c.now().UTC()
 	c.current[chamberID] = cycleValue
 	c.mu.Unlock()
-	_, err := c.recorder.Record(ctx, chamberID, model.EventCycleAdvanced, cycleValue.ID, generation, cycleValue)
-	return err
+	if _, err := c.recorder.Record(ctx, chamberID, model.EventCycleAdvanced, cycleValue.ID, generation, cycleValue); err != nil {
+		return err
+	}
+	if cycleValue.Stage == model.StageCompleted {
+		if tracker := c.waterwayTracker(); tracker != nil {
+			// Departure confirmed by the field signal handoff; free the waterway.
+			if err := tracker.ReleaseAll(ctx, cycleValue, "departure confirmed"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (c *Coordinator) Restore(cycleValue model.TransitCycle) {

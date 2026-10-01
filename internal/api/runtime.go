@@ -16,6 +16,7 @@ import (
 	"github.com/wyw14/cry-96/internal/safety"
 	"github.com/wyw14/cry-96/internal/schedule"
 	"github.com/wyw14/cry-96/internal/signal"
+	"github.com/wyw14/cry-96/internal/waterway"
 )
 
 // Runtime contains the long-lived component graph used by HTTP handlers.
@@ -36,6 +37,7 @@ type Runtime struct {
 	Interlocks      *interlock.Coordinator
 	Cycles          *cycle.Coordinator
 	CycleService    *cycle.Service
+	Waterway        *waterway.Service
 	Leases          *lease.Service
 	LeaseSweeper    *lease.Sweeper
 	Safety          *safety.Service
@@ -87,14 +89,20 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 		interlock.DefaultPolicy(), interlock.NewArbiter(), gateController,
 		levelByChamber, emergencyActive,
 	)
+	waterwayService := waterway.NewService(recorder, now)
 	cycleCoordinator := cycle.NewCoordinator(gateController, hydraulicsController, recorder, now)
-	cycleService := cycle.NewService(cycleCoordinator, admissionService)
+	cycleCoordinator.BindWaterway(waterwayService)
+	cycleService := cycle.NewService(cycleCoordinator, admissionService, waterwayService)
 	safetyCoordinator = safety.NewCoordinator(gateCommands, barrier, recorder, now)
 	safetyService := safety.NewService(safetyCoordinator, cycleCoordinator)
 	signalService.BindTransitLookup(cycleCoordinator)
 	replayer := journal.NewReplayer(store)
 	recovery := cycle.NewRecovery(replayer, cycleCoordinator)
 	if _, err := recovery.RestoreAll(ctx); err != nil {
+		return nil, err
+	}
+	waterwayRecovery := waterway.NewRecovery(replayer, waterwayService)
+	if _, err := waterwayRecovery.RestoreAll(ctx); err != nil {
 		return nil, err
 	}
 	health := monitor.NewHealthRegistry()
@@ -113,7 +121,8 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 		AdmissionQueue: admissionController.Queue(), Admission: admissionService,
 		Planner: planner, Schedule: scheduleService, Hydraulics: hydraulicsController,
 		Interlocks: interlockCoordinator, Cycles: cycleCoordinator, CycleService: cycleService,
-		Leases: leaseService, LeaseSweeper: leaseSweeper, Safety: safetyService,
+		Waterway: waterwayService,
+		Leases:   leaseService, LeaseSweeper: leaseSweeper, Safety: safetyService,
 		Snapshot:  monitor.NewSnapshot(cycleCoordinator, gateState, admissionService, signalService, safetyService, now),
 		Incidents: monitor.NewIncidentReview(store), Health: health, Recovery: recovery,
 		Chambers: chambers, Now: now,

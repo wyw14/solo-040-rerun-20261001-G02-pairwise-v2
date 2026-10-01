@@ -12,7 +12,13 @@
       <div class="message" id="plan-message"></div>
     </form></section>
     <section class="panel"><h2>Current transit</h2><div class="metrics"><div class="metric">Chamber<strong id="metric-chamber">-</strong></div><div class="metric">Stage<strong id="metric-stage">-</strong></div><div class="metric">Cycle<strong id="metric-cycle">-</strong></div></div></section>
+    <section class="panel wide"><h2>Shared waterway</h2>
+      <div class="metrics"><div class="metric">Upstream<strong id="waterway-upstream">-</strong></div><div class="metric">Downstream<strong id="waterway-downstream">-</strong></div><div class="metric">Active holds<strong id="waterway-count">0</strong></div></div>
+      <div class="message" id="waterway-blocked"></div>
+      <table><thead><tr><th>Fleet</th><th>Chamber</th><th>Direction</th><th>Phase</th><th>Since</th><th></th></tr></thead><tbody id="waterway"></tbody></table>
+      <div class="message" id="waterway-message"></div>
+    </section>
     <section class="panel wide"><h2>Active plans</h2><table><thead><tr><th>Chamber</th><th>Plan</th><th>Direction</th><th>Vessels</th><th>Created</th></tr></thead><tbody id="plans"></tbody></table></section>
   </div>
-</main><script src="/assets/app.js"></script><script src="/assets/operations.js"></script>
+</main><script src="/assets/app.js"></script><script src="/assets/operations.js"></script><script src="/assets/waterway.js"></script>
 </body></html>
