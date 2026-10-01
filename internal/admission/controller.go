@@ -9,6 +9,7 @@ import (
 	"github.com/wyw14/cry-96/internal/gate"
 	"github.com/wyw14/cry-96/internal/model"
 	"github.com/wyw14/cry-96/internal/signal"
+	"github.com/wyw14/cry-96/internal/waterspace"
 )
 
 type Decision struct {
@@ -17,12 +18,18 @@ type Decision struct {
 	VesselID uuid.UUID `json:"vessel_id,omitempty"`
 }
 
+// EntryClearance reports whether a transit may enter its shared approach reach.
+type EntryClearance interface {
+	EntryVerdict(model.TransitCycle) waterspace.Verdict
+}
+
 // Controller grants admission only from observed sealed gate positions.
 type Controller struct {
-	queue   *Queue
-	gates   *gate.State
-	signals *signal.Store
-	now     func() time.Time
+	queue     *Queue
+	gates     *gate.State
+	signals   *signal.Store
+	clearance EntryClearance
+	now       func() time.Time
 }
 
 func NewController(queue *Queue, gates *gate.State, signals *signal.Store, now func() time.Time) *Controller {
@@ -31,6 +38,9 @@ func NewController(queue *Queue, gates *gate.State, signals *signal.Store, now f
 	}
 	return &Controller{queue: queue, gates: gates, signals: signals, now: now}
 }
+
+// BindClearance attaches shared-water arbitration.
+func (c *Controller) BindClearance(clearance EntryClearance) { c.clearance = clearance }
 
 func (c *Controller) Evaluate(ctx context.Context, cycle model.TransitCycle) (Decision, error) {
 	if err := ctx.Err(); err != nil {
@@ -45,6 +55,16 @@ func (c *Controller) Evaluate(ctx context.Context, cycle model.TransitCycle) (De
 	}
 	if !c.gates.Sealed(cycle.ChamberID) {
 		return Decision{VesselID: entry.Vessel.ID, Reason: "chamber gates are not sealed"}, nil
+	}
+	if c.clearance != nil {
+		verdict := c.clearance.EntryVerdict(cycle)
+		if !verdict.Granted {
+			reason := verdict.Reason
+			if reason == "" {
+				reason = "shared approach waterway clearance not granted"
+			}
+			return Decision{VesselID: entry.Vessel.ID, Reason: reason}, nil
+		}
 	}
 	state := c.signals.Set(entry.Vessel.ID, cycle.ID, cycle.Generation, model.SignalProceed, c.now())
 	if state.Aspect != model.SignalProceed || !c.queue.MarkReleased(cycle.ChamberID, entry.Vessel.ID) {

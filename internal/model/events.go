@@ -21,6 +21,8 @@ const (
 	EventLeaseChanged     EventType = "lease.changed"
 	EventEmergencyStarted EventType = "emergency.started"
 	EventEmergencySettled EventType = "emergency.settled"
+	EventWaterwayAcquired EventType = "waterway.acquired"
+	EventWaterwayReleased EventType = "waterway.released"
 	EventReplayWarning    EventType = "replay.warning"
 )
 

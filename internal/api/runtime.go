@@ -16,6 +16,7 @@ import (
 	"github.com/wyw14/cry-96/internal/safety"
 	"github.com/wyw14/cry-96/internal/schedule"
 	"github.com/wyw14/cry-96/internal/signal"
+	"github.com/wyw14/cry-96/internal/waterspace"
 )
 
 // Runtime contains the long-lived component graph used by HTTP handlers.
@@ -39,6 +40,8 @@ type Runtime struct {
 	Leases          *lease.Service
 	LeaseSweeper    *lease.Sweeper
 	Safety          *safety.Service
+	Waterways       *waterspace.Service
+	WaterRecovery   *waterspace.Recovery
 	Snapshot        *monitor.Snapshot
 	Incidents       *monitor.IncidentReview
 	Health          *monitor.HealthRegistry
@@ -89,12 +92,31 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 	)
 	cycleCoordinator := cycle.NewCoordinator(gateController, hydraulicsController, recorder, now)
 	cycleService := cycle.NewService(cycleCoordinator, admissionService)
+	waterArbiter := waterspace.NewArbiter(now)
+	waterService := waterspace.NewService(waterArbiter, recorder, now)
+	admissionController.BindClearance(waterService)
+	interlockCoordinator.BindClearance(waterService)
+	cycleCoordinator.BindWaterways(waterService)
 	safetyCoordinator = safety.NewCoordinator(gateCommands, barrier, recorder, now)
 	safetyService := safety.NewService(safetyCoordinator, cycleCoordinator)
 	signalService.BindTransitLookup(cycleCoordinator)
+	// When a blocked convoy wins its reach, re-run admission so its field
+	// signal flips to proceed without an operator retry. Exit-leg promotions
+	// (releasing stage) are left for the operator to retry the gate command.
+	waterService.OnPromoted(func(promoteCtx context.Context, promotedCycle model.TransitCycle) {
+		active, ok := cycleCoordinator.Current(promotedCycle.ChamberID)
+		if !ok || active.Stage != model.StagePlanned && active.Stage != model.StageAdmitting {
+			return
+		}
+		_, _ = admissionService.Admit(promoteCtx, active)
+	})
 	replayer := journal.NewReplayer(store)
 	recovery := cycle.NewRecovery(replayer, cycleCoordinator)
 	if _, err := recovery.RestoreAll(ctx); err != nil {
+		return nil, err
+	}
+	waterRecovery := waterspace.NewRecovery(store, waterService)
+	if _, err := waterRecovery.RestoreAll(ctx); err != nil {
 		return nil, err
 	}
 	health := monitor.NewHealthRegistry()
@@ -114,6 +136,7 @@ func NewRuntime(ctx context.Context, dataDirectory string) (*Runtime, error) {
 		Planner: planner, Schedule: scheduleService, Hydraulics: hydraulicsController,
 		Interlocks: interlockCoordinator, Cycles: cycleCoordinator, CycleService: cycleService,
 		Leases: leaseService, LeaseSweeper: leaseSweeper, Safety: safetyService,
+		Waterways: waterService, WaterRecovery: waterRecovery,
 		Snapshot:  monitor.NewSnapshot(cycleCoordinator, gateState, admissionService, signalService, safetyService, now),
 		Incidents: monitor.NewIncidentReview(store), Health: health, Recovery: recovery,
 		Chambers: chambers, Now: now,

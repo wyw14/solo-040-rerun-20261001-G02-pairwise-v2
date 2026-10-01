@@ -11,7 +11,16 @@ import (
 	"github.com/wyw14/cry-96/internal/hydraulics"
 	"github.com/wyw14/cry-96/internal/journal"
 	"github.com/wyw14/cry-96/internal/model"
+	"github.com/wyw14/cry-96/internal/waterspace"
 )
+
+// Waterways is the shared pilotage-reach arbitration used by a transit.
+type Waterways interface {
+	AcquireEntry(context.Context, model.TransitCycle, model.ConvoyPlan) (waterspace.Verdict, error)
+	AcquireExit(context.Context, model.TransitCycle) (waterspace.Verdict, error)
+	ReleasePhase(context.Context, string, uuid.UUID, uint64, waterspace.Phase, string) error
+	ReleaseCycle(context.Context, string, uuid.UUID, uint64, string) error
+}
 
 // Coordinator is the authoritative owner of active transit generations.
 type Coordinator struct {
@@ -21,6 +30,7 @@ type Coordinator struct {
 	gates       *gate.Controller
 	hydraulics  *hydraulics.Controller
 	recorder    *journal.Recorder
+	waterways   Waterways
 	now         func() time.Time
 }
 
@@ -32,6 +42,14 @@ func NewCoordinator(gates *gate.Controller, hydraulicsController *hydraulics.Con
 		current: make(map[string]model.TransitCycle), generations: make(map[string]uint64),
 		gates: gates, hydraulics: hydraulicsController, recorder: recorder, now: now,
 	}
+}
+
+// BindWaterways attaches shared-reach arbitration after the component graph
+// has been wired.
+func (c *Coordinator) BindWaterways(waterways Waterways) {
+	c.mu.Lock()
+	c.waterways = waterways
+	c.mu.Unlock()
 }
 
 func (c *Coordinator) Start(ctx context.Context, plan model.ConvoyPlan) (model.TransitCycle, error) {
@@ -51,6 +69,13 @@ func (c *Coordinator) Start(ctx context.Context, plan model.ConvoyPlan) (model.T
 	}
 	if _, err := c.recorder.Record(ctx, plan.ChamberID, model.EventCycleCreated, cycleValue.ID, cycleValue.Generation, cycleValue); err != nil {
 		return model.TransitCycle{}, err
+	}
+	// The convoy applies for its shared approach reach before it may enter.
+	// A contested reach leaves the transit alive but un-cleared to proceed.
+	if c.waterways != nil {
+		if _, err := c.waterways.AcquireEntry(ctx, cycleValue, plan); err != nil {
+			return model.TransitCycle{}, err
+		}
 	}
 	return cycleValue, nil
 }
@@ -75,8 +100,16 @@ func (c *Coordinator) Cancel(ctx context.Context, chamberID, reason string) (mod
 	}
 	c.current[chamberID] = cycleValue
 	c.mu.Unlock()
-	_, err := c.recorder.Record(ctx, chamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue)
-	return cycleValue, err
+	if _, err := c.recorder.Record(ctx, chamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue); err != nil {
+		return model.TransitCycle{}, err
+	}
+	// Cancellation and emergency stops must always free shared water.
+	if c.waterways != nil {
+		if err := c.waterways.ReleaseCycle(ctx, chamberID, cycleValue.ID, cycleValue.Generation, "cycle "+string(cycleValue.Stage)+": "+reason); err != nil {
+			return model.TransitCycle{}, err
+		}
+	}
+	return cycleValue, nil
 }
 
 func (c *Coordinator) ApplyGateAck(ctx context.Context, ack model.DeviceAck) error {
@@ -106,8 +139,16 @@ func (c *Coordinator) ApplyGateAck(ctx context.Context, ack model.DeviceAck) err
 			return err
 		}
 	}
-	_, err = c.recorder.Record(ctx, ack.ChamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue)
-	return err
+	if _, err = c.recorder.Record(ctx, ack.ChamberID, model.EventCycleAdvanced, cycleValue.ID, cycleValue.Generation, cycleValue); err != nil {
+		return err
+	}
+	// Once sealed inside the chamber the approach reach is clear again.
+	if next == model.StageSealed && c.waterways != nil {
+		if err := c.waterways.ReleasePhase(ctx, ack.ChamberID, cycleValue.ID, cycleValue.Generation, waterspace.PhaseEntry, "convoy sealed inside chamber"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Coordinator) ApplySignalHandoff(ctx context.Context, cycleID uuid.UUID, generation uint64) error {
@@ -131,8 +172,16 @@ func (c *Coordinator) ApplySignalHandoff(ctx context.Context, cycleID uuid.UUID,
 	cycleValue.UpdatedAt = c.now().UTC()
 	c.current[chamberID] = cycleValue
 	c.mu.Unlock()
-	_, err := c.recorder.Record(ctx, chamberID, model.EventCycleAdvanced, cycleValue.ID, generation, cycleValue)
-	return err
+	if _, err := c.recorder.Record(ctx, chamberID, model.EventCycleAdvanced, cycleValue.ID, generation, cycleValue); err != nil {
+		return err
+	}
+	// Field confirmation that the convoy has cleared the exit reach.
+	if c.waterways != nil {
+		if err := c.waterways.ReleasePhase(ctx, chamberID, cycleID, generation, waterspace.PhaseExit, "departure confirmed by field signal handoff"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Coordinator) Restore(cycleValue model.TransitCycle) {

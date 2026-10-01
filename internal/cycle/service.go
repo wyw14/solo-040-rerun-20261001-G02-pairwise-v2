@@ -2,7 +2,6 @@ package cycle
 
 import (
 	"context"
-	"errors"
 
 	"github.com/wyw14/cry-96/internal/admission"
 	"github.com/wyw14/cry-96/internal/model"
@@ -28,7 +27,10 @@ func (s *Service) Start(ctx context.Context, plan model.ConvoyPlan) (model.Trans
 		return model.TransitCycle{}, err
 	}
 	if !decision.Allowed {
-		return cycleValue, errors.New(decision.Reason)
+		// The transit is queued and waiting for shared-water clearance. It is
+		// not an error: the convoy receives its proceed signal when the
+		// arbiter promotes the request after the opposing convoy clears.
+		return cycleValue, nil
 	}
 	return cycleValue, nil
 }
